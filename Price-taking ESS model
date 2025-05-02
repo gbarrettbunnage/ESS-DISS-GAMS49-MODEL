@@ -1,0 +1,985 @@
+Sets
+    t  "Time periods (23 to 26 Feb 2025, half-hourly resolution)" / t1*t192 /
+    g  "Generators" / g1*g139 /
+    y  "Years for NPV calculation" / y1*y40 /
+    i  "Test discount rate indices" / i1*i20 /;
+
+* ESD technology properties
+Set storage_types / 
+    LIB_2hr "Lithium-ion Battery - 2 hour",
+    LIB_4hr "Lithium-ion Battery - 4 hour",
+    LIB_6hr "Lithium-ion Battery - 6 hour",
+    PbAcid "Lead-Acid Battery",
+    NaS "Sodium Sulphur Battery",
+    VRFB "Vanadium Redox Flow Battery",
+    PSH "Pumped Storage Hydropower",
+    CAES "Compressed Air Energy Storage" /;
+
+Table storage_properties(storage_types,*)
+               efficiency  power_cap  energy_cap  power_cost   energy_cost   lifetime  om_cost  degradation DoD
+LIB_2hr        0.86        100        200         226320       294400        10        9200     0.017       0.8
+LIB_4hr        0.86        100        400         226320       294400        10        9200     0.017       0.8
+LIB_6hr        0.86        100        600         226320       294400        10        9200     0.017       0.8
+PbAcid         0.72        100        400         126040       323840        3         4701.2   0.022       1.0
+NaS            0.75        100        600         414000       730480        13.5      9200     0.016       0.8
+VRFB           0.7375      50         400         126040       444360        15        5418.82  0.017       1.0
+PSH            0.7375      50         1000        1058736      66608         40        4490.4   0.004       1.0
+CAES           0.58        50         500         1060760      3367.2        25        4830.4   0.007       1.0;
+
+$set STORAGE_TYPE PSH
+
+* ESD cost reduction forecast data
+Set cost_years "Years for cost reduction data" / y2015, y2020, y2025, y2030, y2035, y2040, y2045, y2050 /;
+
+Table cost_reduction(cost_years, storage_types) "Cost reduction factors relative to 2015"
+           LIB_2hr  LIB_4hr  LIB_6hr  PbAcid   NaS      VRFB     PSH      CAES
+y2015      1.00     1.00     1.00     1.00     1.00     1.00     1.00     1.00
+y2020      0.55     0.55     0.55     0.80     0.84     0.49     1.00     1.00
+y2025      0.34     0.34     0.34     0.68     0.66     0.34     1.00     1.00
+y2030      0.23     0.23     0.23     0.63     0.53     0.26     1.00     1.00
+y2035      0.18     0.18     0.18     0.61     0.44     0.21     1.01     1.01
+y2040      0.16     0.16     0.16     0.59     0.39     0.19     1.01     1.01
+y2045      0.15     0.15     0.15     0.59     0.36     0.18     1.02     1.02
+y2050      0.14     0.14     0.14     0.58     0.33     0.17     1.02     1.02;
+
+Scalar base_cost_year "Base year of ESD properties data" / 2021 /;
+
+Parameters
+* ESD parameters
+    VREmultiple "Multiplies Actual VRE generation" / 2.093 /
+    eta         "Roundtrip efficiency"
+    R_max       "Power capacity (MW)"
+    S_max       "Energy capacity (MWh)"
+    degradation_rate "Yearly degradation rate"
+    z0          "Initial ESD charge level (MWh)" / 0 /
+    FCAdj       "Adjusts forecasted price variable to approximate actual DE-LU day-ahead prices" / 0.89 /
+    bigM        "LP solving method using Dantzig's (1947) simplex algorithm" / 100000 /
+    
+* Economic parameters
+    energy_cost     "Energy cost (€ per MWh)"
+    power_cost      "Power cost (€ per MW)"
+    ESD_lifetime    "ESD lifetime (years)"
+    ESD_om_cost     "Annual O&M costs (€ per MW per year)"
+    DoD             "Maximum depth of discharge (fraction of capacity)"
+    yearly_cost_factor(y) "Cost reduction factor for each year"
+    discount_rate   "Annual discount rate" / 0.08 /
+    days_per_year   "Number of operating days per year" / 350 /
+    half_hours      "Number of half hours in a day" / 48 /
+
+* ESD cost reduction parameters
+    start_year "Starting year" / 2030 /
+    base_load_year "Year of load/VRE generation data" / 2025 /
+    base_year_factor "Cost reduction factor for base cost year"
+    next_cost_year "Next cost year after base year"
+    prev_cost_year "Previous cost year before base year"
+    next_factor "Cost reduction factor for next cost year"
+    prev_factor "Cost reduction factor for previous cost year"
+    base_power_cost "Power cost before reduction factors (€/MW)"
+    base_energy_cost "Energy cost before reduction factors (€/MWh)"
+    base_om_cost "O&M cost before reduction factors (€ per MW per year)"
+
+* Economic calculation parameters
+    initial_investment  "Total initial investment cost (€)"
+    initial_investment_by_year(y) "Initial investment with cost reduction by year"
+    annual_profit       "Annual profit from ESD operation (€)"
+    annual_om_cost      "Annual O&M cost (€)"
+    NPV                 "Net present value of the investment (€)"
+    IRR                 "Internal rate of return (%)"
+    payback_period      "Simple payback period (years)"
+    LCOS                "Levelised cost of electricity storage (€/MWh)"
+    total_discharged    "Total energy discharged (MWh)"
+    daily_cycles        "Number of equivalent full cycles per day"
+    annual_cycles       "Number of equivalent full cycles per year"
+    total_cycles        "Total cycles over ESD lifetime"
+    charging_cost       "Cost of charging across sample period (€)"
+    annual_charging_cost "Annual cost of charging the ESD (€)"
+    discounted_charging_cost "Discounted lifetime charging cost (€)"
+    discounted_profit   "Discounted lifetime profit (€)"
+    discounted_cost     "Discounted lifetime cost (€)";
+    
+* Parameter values by storage type
+    R_max = storage_properties('%STORAGE_TYPE%','power_cap');
+    S_max = storage_properties('%STORAGE_TYPE%','energy_cap');
+    power_cost = storage_properties('%STORAGE_TYPE%','power_cost');
+    energy_cost = storage_properties('%STORAGE_TYPE%','energy_cost');
+    eta = storage_properties('%STORAGE_TYPE%','efficiency');
+    DoD = storage_properties('%STORAGE_TYPE%','DoD');
+    ESD_lifetime = storage_properties('%STORAGE_TYPE%','lifetime');
+    ESD_om_cost = storage_properties('%STORAGE_TYPE%','om_cost');
+    degradation_rate = storage_properties('%STORAGE_TYPE%','degradation')
+    
+* Define Merit Order curve, aggregating generators with MC common to 1 d.p.
+Table generator_data(g,*) "Generator capacity, marginal cost, and cumulative capacity"
+        cap      mc       cum_cap
+    g1  1662.11  1      1662.11
+    g2  548.10   87     2210.21
+    g3  2682.79  88     4893.01
+    g4  2135.24  90     7028.25
+    g5  546.36   91     7574.61
+    g6  2115.19  93     9689.80
+    g7  933.31   95     10623.11
+    g8  17.23    98     10640.33
+    g9  122.76   99     10763.09
+    g10 35.60    100    10798.69
+    g11 4020.14  101    14818.84
+    g12 1944.13  102    16762.97
+    g13 435.00   103    17197.97
+    g14 3824.39  104    21022.35
+    g15 3003.26  105    24025.62
+    g16 1220.95  106    25246.57
+    g17 2056.59  107    27303.16
+    g18 1824.71  108    29127.87
+    g19 1340.64  109    30468.51
+    g20 1573.12  110    32041.63
+    g21 267.96   111    32309.59
+    g22 42.40    112    32351.99
+    g23 840.28   113    33192.27
+    g24 410.02   114    33602.29
+    g25 1631.21  115    35233.50
+    g26 700.16   116    35933.66
+    g27 1195.99  117    37129.65
+    g28 1352.58  118    38482.22
+    g29 880.48   119    39362.70
+    g30 157.07   120    39519.77
+    g31 700.39   121    40220.16
+    g32 868.23   122    41088.39
+    g33 360.27   123    41448.66
+    g34 939.56   124    42388.21
+    g35 23.68    125    42411.89
+    g36 2.61     126    42414.50
+    g37 622.87   127    43037.37
+    g38 547.54   128    43584.91
+    g39 386.28   129    43971.19
+    g40 211.35   130    44182.53
+    g41 136.14   132    44318.67
+    g42 23.92    133    44342.59
+    g43 829.39   134    45171.98
+    g44 340.71   135    45512.69
+    g45 276.00   136    45788.69
+    g46 66.51    137    45855.20
+    g47 826.50   138    46681.70
+    g48 114.41   139    46796.11
+    g49 1040.06  141    47836.17
+    g50 106.83   142    47943.00
+    g51 14.40    143    47957.40
+    g52 118.60   144    48076.00
+    g53 603.47   146    48679.46
+    g54 913.38   147    49592.85
+    g55 13.05    149    49605.90
+    g56 279.27   150    49885.17
+    g57 377.46   151    50262.62
+    g58 16.95    152    50279.57
+    g59 95.67    154    50375.25
+    g60 17.40    155    50392.65
+    g61 584.40   156    50977.05
+    g62 665.86   157    51642.91
+    g63 1083.80  158    52726.72
+    g64 225.16   159    52951.88
+    g65 107.89   161    53059.77
+    g66 273.41   162    53333.18
+    g67 176.59   163    53509.77
+    g68 75.69    164    53585.46
+    g69 141.81   165    53727.26
+    g70 315.61   166    54042.87
+    g71 229.69   167    54272.57
+    g72 108.81   168    54381.37
+    g73 11.15    169    54392.53
+    g74 151.35   170    54543.87
+    g75 75.77    171    54619.64
+    g76 28.71    172    54648.35
+    g77 113.60   173    54761.95
+    g78 50.46    174    54812.41
+    g79 97.94    175    54910.36
+    g80 41.15    176    54951.51
+    g81 140.51   177    55092.01
+    g82 3749.56  178    58841.57
+    g83 83.48    179    58925.05
+    g84 20.92    180    58945.97
+    g85 62.71    181    59008.68
+    g86 42.20    182    59050.87
+    g87 4.30     184    59055.17
+    g88 290.31   185    59345.48
+    g89 97.44    186    59442.92
+    g90 85.26    187    59528.18
+    g91 22.62    190    59550.80
+    g92 212.51   191    59763.31
+    g93 62.93    193    59826.23
+    g94 14.74    194    59840.97
+    g95 265.96   200    60106.93
+    g96 14.45    201    60121.38
+    g97 58.03    202    60179.41
+    g98 92.94    203    60272.35
+    g99 39.15    207    60311.50
+    g100 21.75    218    60333.25
+    g101 30.84    234    60364.10
+    g102 16.15    245    60380.25
+    g103 42.95    252    60423.20
+    g104 63.54    263    60486.73
+    g105 55.68    266    60542.41
+    g106 59.48    274    60601.89
+    g107 95.20    277    60697.09
+    g108 37.43    278    60734.52
+    g109 1.16     279    60735.68
+    g110 71.24    280    60806.91
+    g111 7.40     282    60814.31
+    g112 21.23    285    60835.54
+    g113 58.91    289    60894.44
+    g114 184.28   291    61078.72
+    g115 47.60    292    61126.32
+    g116 272.35   293    61398.67
+    g117 29.33    294    61428.00
+    g118 9.04     296    61437.04
+    g119 1019.61  297    62456.65
+    g120 585.36   301    63042.01
+    g121 164.37   305    63206.38
+    g122 25.50    306    63231.88
+    g123 18.19    308    63250.07
+    g124 352.75   312    63602.82
+    g125 76.50    313    63679.32
+    g126 97.75    314    63777.07
+    g127 46.89    319    63823.96
+    g128 114.92   324    63938.88
+    g129 78.88    334    64017.76
+    g130 115.60   336    64133.36
+    g131 34.54    337    64167.91
+    g132 2.27     339    64170.17
+    g133 41.65    350    64211.82
+    g134 73.10    353    64284.92
+    g135 47.60    359    64332.52
+    g136 73.27    362    64405.79
+    g137 28.90    365    64434.69
+    g138 84.72    381    64519.41
+    g139 39.70    483    64559.11;
+
+
+* Define system load values
+Table L(t,*) "System Load in MW"
+        load
+    t1  43166.31
+    t2  42424.16
+    t3  41379.78
+    t4  40670.15
+    t5  40050.36
+    t6  39950.3
+    t7  40003.02
+    t8  40078.76
+    t9  40182.67
+    t10 40112.04
+    t11 40240.8
+    t12 40172.23
+    t13 40846.97
+    t14 41507.66
+    t15 42463.86
+    t16 43900.79
+    t17 45464.8
+    t18 46697.43
+    t19 48042.86
+    t20 49465.15
+    t21 50713.42
+    t22 51694.25
+    t23 52686.57
+    t24 53638.2
+    t25 52718.5
+    t26 52089.16
+    t27 50215.89
+    t28 48737.78
+    t29 48311.17
+    t30 48108.51
+    t31 47452.07
+    t32 47331.21
+    t33 47689.12
+    t34 48069.31
+    t35 49925.12
+    t36 51719.57
+    t37 54180.5
+    t38 54197.12
+    t39 53488.91
+    t40 52846.05
+    t41 51910.26
+    t42 50897.2
+    t43 50768
+    t44 50326.55
+    t45 50683.81
+    t46 49299.48
+    t47 48118.24
+    t48 46790.79
+    t49 45930.53
+    t50 45651.12
+    t51 44814.53
+    t52 44699.46
+    t53 44771.85
+    t54 45016.71
+    t55 45645.93
+    t56 45949.98
+    t57 46990.08
+    t58 48210.92
+    t59 50768.3
+    t60 53362.41
+    t61 58259.76
+    t62 61964.2
+    t63 63680.49
+    t64 65602.7
+    t65 67273.17
+    t66 68186.76
+    t67 68777.17
+    t68 69493.1
+    t69 69343.27
+    t70 69416.74
+    t71 68960.34
+    t72 68844.13
+    t73 68459.27
+    t74 68279.24
+    t75 67799.62
+    t76 66969.37
+    t77 65328.53
+    t78 64885.23
+    t79 64315.35
+    t80 63700.07
+    t81 63765.8
+    t82 63750.15
+    t83 65075.62
+    t84 66077.61
+    t85 67179.26
+    t86 67220.23
+    t87 66273.58
+    t88 64808.07
+    t89 62707.42
+    t90 60562.8
+    t91 59467.19
+    t92 57064.61
+    t93 55214.04
+    t94 53038.56
+    t95 51349.16
+    t96 49946.6
+    t97 47985.06
+    t98 46986.94
+    t99 46047.65
+    t100    45659.99
+    t101    45092.88
+    t102    45190.96
+    t103    45499.77
+    t104    45779.13
+    t105    46460.56
+    t106    47271.06
+    t107    49946.72
+    t108    52827.67
+    t109    57986.92
+    t110    62201.51
+    t111    64488.9
+    t112    65066.86
+    t113    66267.06
+    t114    66960.99
+    t115    66429.34
+    t116    67101.72
+    t117    67619.26
+    t118    68470.14
+    t119    68260.78
+    t120    68374.03
+    t121    67464.13
+    t122    66775.41
+    t123    66755.73
+    t124    65593.87
+    t125    65095.76
+    t126    64813.41
+    t127    64067.42
+    t128    63720.57
+    t129    63191.99
+    t130    63162.99
+    t131    64135.06
+    t132    65374.84
+    t133    66811.01
+    t134    67046.99
+    t135    66138.18
+    t136    64783.22
+    t137    63318.53
+    t138    61152.07
+    t139    59993.26
+    t140    58299.93
+    t141    56861.19
+    t142    54813.53
+    t143    52272.38
+    t144    50525.49
+    t145    49586.72
+    t146    48202.96
+    t147    47721.19
+    t148    47029.19
+    t149    46499.07
+    t150    46736.8
+    t151    46740.54
+    t152    47088.73
+    t153    47891.01
+    t154    49136.68
+    t155    51460.76
+    t156    54152.1
+    t157    59472.71
+    t158    62153.56
+    t159    64865.83
+    t160    66111.72
+    t161    67437.69
+    t162    68366.35
+    t163    68487.89
+    t164    69149.25
+    t165    69425.93
+    t166    69747.83
+    t167    69819.87
+    t168    69948.78
+    t169    69333.12
+    t170    69381.05
+    t171    68591.49
+    t172    67457.38
+    t173    66753.35
+    t174    66567.69
+    t175    65827.28
+    t176    64816.88
+    t177    64376.79
+    t178    64915.28
+    t179    65721.28
+    t180    67153.8
+    t181    67802.63
+    t182    67900.73
+    t183    67097.02
+    t184    66422.8
+    t185    64383.44
+    t186    63012.43
+    t187    61300.96
+    t188    59386.83
+    t189    58192.68
+    t190    56278.82
+    t191    54796.82
+    t192    52265.25;
+
+* Define VRE generation values (wind & solar)
+Table RenewGen(t,*) "Renewable generation in period t (MW)"
+            gen
+    t1  20568.00
+    t2  19693.00
+    t3  18886.00
+    t4  17849.00
+    t5  17097.00
+    t6  16617.00
+    t7  15969.00
+    t8  16044.00
+    t9  15823.00
+    t10 15414.00
+    t11 14778.00
+    t12 14355.00
+    t13 14109.00
+    t14 13527.00
+    t15 13003.00
+    t16 13982.00
+    t17 15041.00
+    t18 16590.00
+    t19 18989.00
+    t20 22023.00
+    t21 26104.00
+    t22 29748.00
+    t23 32177.00
+    t24 33908.00
+    t25 35868.00
+    t26 35568.00
+    t27 35734.00
+    t28 34292.00
+    t29 32782.00
+    t30 30767.00
+    t31 27082.00
+    t32 22686.00
+    t33 18426.00
+    t34 13968.00
+    t35 11171.00
+    t36 10986.00
+    t37 11826.00
+    t38 13553.00
+    t39 15704.00
+    t40 17211.00
+    t41 19340.00
+    t42 20631.00
+    t43 21731.00
+    t44 22700.00
+    t45 22534.00
+    t46 23264.00
+    t47 23800.00
+    t48 24258.00
+    t49 25357.00
+    t50 25611.00
+    t51 25557.00
+    t52 25543.00
+    t53 25673.00
+    t54 25853.00
+    t55 26513.00
+    t56 26815.00
+    t57 27413.00
+    t58 28024.00
+    t59 28640.00
+    t60 29628.00
+    t61 31388.00
+    t62 31585.00
+    t63 32272.00
+    t64 34748.00
+    t65 37290.00
+    t66 40265.00
+    t67 42867.00
+    t68 44793.00
+    t69 46274.00
+    t70 47476.00
+    t71 48574.00
+    t72 49647.00
+    t73 49993.00
+    t74 49037.00
+    t75 48526.00
+    t76 46481.00
+    t77 44569.00
+    t78 41837.00
+    t79 39374.00
+    t80 37590.00
+    t81 35904.00
+    t82 34158.00
+    t83 33288.00
+    t84 32977.00
+    t85 34144.00
+    t86 34327.00
+    t87 33956.00
+    t88 33276.00
+    t89 32743.00
+    t90 31580.00
+    t91 30298.00
+    t92 28411.00
+    t93 26444.00
+    t94 25562.00
+    t95 24279.00
+    t96 22991.00
+    t97 21749.00
+    t98 20397.00
+    t99 19468.00
+    t100    18437.00
+    t101    17282.00
+    t102    16236.00
+    t103    15049.00
+    t104    14227.00
+    t105    12968.00
+    t106    12028.00
+    t107    11231.00
+    t108    10212.00
+    t109    9512.00
+    t110    9359.00
+    t111    8760.00
+    t112    9144.00
+    t113    10185.00
+    t114    12592.00
+    t115    15979.00
+    t116    19636.00
+    t117    22733.00
+    t118    25298.00
+    t119    26794.00
+    t120    26575.00
+    t121    25632.00
+    t122    23917.00
+    t123    21801.00
+    t124    19397.00
+    t125    17299.00
+    t126    14537.00
+    t127    11502.00
+    t128    8436.00
+    t129    5995.00
+    t130    4031.00
+    t131    2600.00
+    t132    1975.00
+    t133    2240.00
+    t134    2494.00
+    t135    2783.00
+    t136    2945.00
+    t137    3098.00
+    t138    3277.00
+    t139    3538.00
+    t140    3857.00
+    t141    4076.00
+    t142    4082.00
+    t143    4264.00
+    t144    4455.00
+    t145    4614.00
+    t146    4396.00
+    t147    4343.00
+    t148    4546.00
+    t149    4921.00
+    t150    5175.00
+    t151    5527.00
+    t152    5806.00
+    t153    6386.00
+    t154    6869.00
+    t155    7081.00
+    t156    7311.00
+    t157    7804.00
+    t158    7963.00
+    t159    7802.00
+    t160    8735.00
+    t161    9696.00
+    t162    10998.00
+    t163    11998.00
+    t164    13297.00
+    t165    14553.00
+    t166    15572.00
+    t167    16456.00
+    t168    17036.00
+    t169    16989.00
+    t170    16892.00
+    t171    16524.00
+    t172    16331.00
+    t173    16140.00
+    t174    15410.00
+    t175    14390.00
+    t176    12916.00
+    t177    11191.00
+    t178    9140.00
+    t179    7661.00
+    t180    7132.00
+    t181    7524.00
+    t182    8320.00
+    t183    9560.00
+    t184    11028.00
+    t185    12548.00
+    t186    13919.00
+    t187    14980.00
+    t188    16196.00
+    t189    16810.00
+    t190    17255.00
+    t191    17501.00
+    t192    17544.00;
+
+* VRE generation multiplier to mimic Energiewende
+RenewGen(t, 'gen') = VREMultiple * RenewGen(t, 'gen');
+
+Variables
+    profit  "Total profit (€)"
+    Revenue(t) "Revenue in each period (€)"
+    q(g,t)  "Power generation of generator g in period t (MW)"
+    P(t)    "Market price of electricity in period t (€/MWh)"
+    d(t)    "ESD discharge in period t (MW)"
+    c(t)    "ESD charge in period t (MW)"
+    z(t)    "ESD charge level in period t (MWh)"
+    ResLoad(t) "Residual Load after renewables and storage"
+    Annual_cashflow(y)  "Net annual cashflow in year y (€)"
+    Discounted_cashflow(y) "Discounted cashflow in year y (€)";
+    
+Binary Variables
+    is_marginal(g,t) "1 if generator g is the marginal unit in period t"
+    is_charging(t)  "1 if storage device is charging in period t"
+    positive_regime(t) "1 if in positive residual load regime";
+
+Equations
+    profit_eq   "Profit definition"
+    revenue_eq "Revenue definition per period"
+    demand_eq   "Supply meets demand"
+    capacity_eq "Generator capacity constraints"
+    marginal_constraint1(g,t) "Constraint to identify the marginal generator"
+    marginal_constraint2(g,t) "Constraint to identify the marginal generator"
+    single_marginal(t) "Only one generator can be marginal in positive regime"
+    price_eq  "Market price set by marginal generator"
+    ESD_balance "ESD energy balance constraint"
+    residual_load_eq "Residual load (for generator dispatch functionality)"
+    charge_limit "Charge rate limit"
+    discharge_limit "Discharge rate limit"
+    charging_discharging "Allows ESD to charge and prevents discharge"
+    discharging_charging "Allows ESD to discharge and prevents charge"
+    storage_limit_d "Storage discharge limit"
+    storage_limit_z "Storage capacity limit"
+    non_negativity_d "Non-negativity constraint on discharge"
+    non_negativity_c "Non-negativity constraint on charge"
+    non_negativity_z "Non-negativity constraint on charge level"
+    regime_detection "Determine if residual load is positive or negative";
+
+* ============================================= *
+*  ESD optimisation and power market operation  *
+* ============================================= *
+
+* Objective function: maximise profit (sum of half-hourly revenue)
+profit_eq ..
+    profit =e= sum(t, P(t) * (d(t) - c(t)));
+
+* Revenue in each period
+revenue_eq(t) ..
+    Revenue(t) =e= P(t) * (d(t) - c(t));
+ 
+* Residual load calculation, with load adjusted to reflect annual growth rate
+residual_load_eq(t) ..
+    ResLoad(t) =e= L(t,'load') - RenewGen(t,'gen') - d(t) + c(t);
+   
+* Residual load BigM for negative power prices 
+regime_detection(t) ..
+    L(t,'load') - RenewGen(t,'gen') =l= bigM * positive_regime(t) - 0.001 * (1-positive_regime(t));
+
+* Demand constraint: total generation must equal residual load
+demand_eq(t) ..
+    sum(g, q(g,t)) =e= max(0, L(t,'load') - RenewGen(t,'gen') - d(t) + c(t));
+
+* Capacity constraint: each generator cannot exceed its capacity
+capacity_eq(g,t) ..
+    q(g,t) =l= generator_data(g,'cap');
+
+* Marginal generator BigM for merit order effect
+marginal_constraint1(g,t) ..
+    ResLoad(t) - generator_data(g,'cum_cap') =l= (1 - is_marginal(g,t) + (1-positive_regime(t))) * bigM;
+marginal_constraint2(g,t) ..
+    generator_data(g-1,'cum_cap') - ResLoad(t) =l= (1 - is_marginal(g,t) + (1-positive_regime(t))) * bigM;
+
+* Positive residual load regime corresponds to the merit order curve
+single_marginal(t) ..
+    sum(g, is_marginal(g,t)) =e= positive_regime(t);
+
+* Price determination: set price as the MC of the marginal generator in equilibrium in positive regime and as -10 in negative regime
+price_eq(t) ..
+    P(t) =e= FCAdj * positive_regime(t) * sum(g, generator_data(g,'mc') * is_marginal(g,t)) 
+           + (1-positive_regime(t)) * (-10);
+    
+* ESD energy balance constraint
+ESD_balance(t) ..
+    z(t) =e= z(t-1) + eta * (c(t) - d(t));
+* Set initial ESD charge level to zero
+    z.fx('t1') = z0;
+
+* Charge and discharge constraints: power capacity
+charge_limit(t) ..
+    c(t) =l= R_max;
+discharge_limit(t) ..
+    d(t) =l= R_max;
+* Ensure ESD cannot charge and discharge simultaneously
+charging_discharging(t) ..
+    c(t) =l= is_charging(t) * R_max;
+discharging_charging(t) ..
+    d(t) =l= (1-is_charging(t)) * R_max;
+
+* Energy storage capacity
+* Discharge at full power depletes storage in one hour (i.e. two periods)
+storage_limit_d(t) ..
+    d(t) =l= z(t);
+storage_limit_z(t) ..
+    z(t) =l= S_max * DoD;
+
+* Non-negativity constraints
+non_negativity_d(t) .. d(t) =g= 0;
+non_negativity_c(t) .. c(t) =g= 0;
+non_negativity_z(t) .. z(t) =g= 0;
+
+* Declare the model
+Model German_power_market /all/;
+
+* Allow 10% tolerance to improve solution time
+Option optcr = 0.1;
+
+* Solve
+Solve German_power_market using MINLP maximizing profit;
+
+* Display ESD results
+Display profit.l, P.l, Revenue.l, ResLoad.l, d.l, c.l, z.l;
+
+* ============================================= *
+*        ESD cost reduction calculations        *
+* ============================================= *
+
+base_power_cost = power_cost;
+base_energy_cost = energy_cost;
+base_om_cost = ESD_om_cost;
+
+* Determine relevant cost years before and after base cost year of 2021
+Set relevant_cost_years(cost_years);
+
+* Initialise variables
+Scalar 
+    next_cost_year "Next cost year after base year" / 0 /
+    prev_cost_year "Previous cost year before base year" / 0 /
+    next_factor "Cost reduction factor for next cost year" / 0 /
+    prev_factor "Cost reduction factor for previous cost year" / 0 /;
+   
+* Find closest years to base cost year (i.e. 2020 and 2025)
+
+    prev_cost_year = 0;
+    next_cost_year = 0;
+    prev_factor = 0;
+    next_factor = 0;
+    
+Loop(cost_years,
+    if(ord(cost_years) * 5 + 2010 <= base_cost_year, 
+        prev_cost_year = ord(cost_years) * 5 + 2010;
+        prev_factor = cost_reduction(cost_years,'%STORAGE_TYPE%');
+    );
+    if(ord(cost_years) * 5 + 2010 > base_cost_year and next_cost_year = 0, 
+        next_cost_year = ord(cost_years) * 5 + 2010;
+        next_factor = cost_reduction(cost_years,'%STORAGE_TYPE%');
+    );
+);
+    
+* Interpolate five-yearly forecast data for cost reduction factor for base cost year
+base_year_factor = prev_factor + (next_factor - prev_factor) * 
+                  (base_cost_year - prev_cost_year) / (next_cost_year - prev_cost_year);
+
+* Calculate factors for each year relative to base cost year (2021), rather than relative to 2015
+* Current year is 'start_year + ord(y) - 1'
+Loop(y,
+    prev_cost_year = 0;
+    next_cost_year = 0;
+    prev_factor = 0;
+    next_factor = 0;
+    
+    Loop(cost_years,
+        if(ord(cost_years) * 5 + 2010 <= start_year + ord(y) - 1, 
+            prev_cost_year = ord(cost_years) * 5 + 2010;
+            prev_factor = cost_reduction(cost_years,'%STORAGE_TYPE%');
+        );
+        if(ord(cost_years) * 5 + 2010 > start_year + ord(y) - 1 and next_cost_year = 0, 
+            next_cost_year = ord(cost_years) * 5 + 2010;
+            next_factor = cost_reduction(cost_years,'%STORAGE_TYPE%');
+        );
+    );
+    
+* If beyond last cost year point, use the last value
+    if(next_cost_year = 0,
+        next_cost_year = prev_cost_year;
+        next_factor = prev_factor;
+    );
+
+* Current years' factor
+if(prev_cost_year = next_cost_year,
+        yearly_cost_factor(y) = prev_factor / base_year_factor;
+    else
+        yearly_cost_factor(y) = (prev_factor + (next_factor - prev_factor) * 
+                              (start_year + ord(y) - 1 - prev_cost_year) / 
+                              (next_cost_year - prev_cost_year)) / base_year_factor;
+    );
+);
+
+* ============================================= *
+*    Economic feasibility (post-optimisation)   *
+* ============================================= *
+
+* Initial investment
+initial_investment = energy_cost * S_max + power_cost * R_max;
+
+* Total energy discharged per day
+total_discharged = sum(t, d.l(t)/2)/4;
+* Convert MWh by dividing discharge power (MW) by 2 (half hours)
+daily_cycles = total_discharged / S_max;
+* Scale to sample period
+annual_cycles = daily_cycles * days_per_year;
+total_cycles = annual_cycles * ESD_lifetime;
+
+* Annual profit
+annual_profit = profit.l * (days_per_year/4);
+* Scale to sample period (divide by # of days covered in data)
+
+* Annual O&M costs
+annual_om_cost = ESD_om_cost * R_max;
+
+* Calculate annual cashflows for each year
+Parameter Annual_cashflow_calc(y);
+
+Loop(y,
+    initial_investment_by_year(y) = (base_energy_cost * yearly_cost_factor(y) * S_max + 
+                                   base_power_cost * yearly_cost_factor(y) * R_max);
+);
+
+* First year investment is actual initial investment
+initial_investment = initial_investment_by_year('y1');
+
+* O&M costs with yearly reduction
+Parameter annual_om_cost_by_year(y) "Annual O&M costs with reduction factor";
+Loop(y,
+    annual_om_cost_by_year(y) = base_om_cost * yearly_cost_factor(y) * R_max;
+);
+
+* Annual cashflows with reduced O&M costs
+Loop(y,
+    Annual_cashflow_calc(y) = annual_profit - annual_om_cost_by_year(y);
+);
+
+* ESD degradation
+Annual_cashflow_calc(y) = Annual_cashflow_calc(y) * (1 - degradation_rate * (ord(y)-1));
+
+* Discounted cashflows (DCF)
+Parameter Discounted_cashflow_calc(y);
+Discounted_cashflow_calc(y) = Annual_cashflow_calc(y) / power((1 + discount_rate), ord(y));
+
+* Calculate NPV
+NPV = -initial_investment;
+Loop(y$(ord(y) <= ESD_lifetime),
+    npv = npv + Annual_cashflow_calc(y) / power((1 + discount_rate), ord(y));
+);
+
+* Discounted charging cost
+charging_cost = sum(t, (P.l(t) * c.l(t)));
+annual_charging_cost = charging_cost * (days_per_year/4);
+discounted_charging_cost = sum(y$(ord(y) <= ESD_lifetime), annual_charging_cost / power((1 + discount_rate), ord(y)));
+
+* Discounted profit and cost
+discounted_profit = sum(y$(ord(y) <= ESD_lifetime), annual_profit / power((1 + discount_rate), ord(y)));
+discounted_cost = initial_investment + discounted_charging_cost + sum(y$(ord(y) <= ESD_lifetime), annual_om_cost / power((1 + discount_rate), ord(y)));
+
+* LCOS (Levelised Cost of electricity Storage)
+LCOS = discounted_cost / sum(y$(ord(y) <= ESD_lifetime), total_discharged * days_per_year / power((1 + discount_rate), ord(y)));
+
+* Simple payback period
+payback_period = initial_investment / (annual_profit - annual_om_cost);
+
+* Internal rate of return (IRR) via interpolation
+Parameter
+    NPV_at_rate(i) "NPV at different discount rates"
+    rate(i) "Test discount rates";
+    
+Table rate_values(i,*) "Values for discount rates"
+         value
+i1       -0.30         
+i2       -0.25
+i3       -0.20
+i4       -0.15
+i5       -0.10
+i6       -0.05
+i7       0.00
+i8       0.05
+i9       0.10
+i10      0.15
+i11      0.20
+i12      0.25
+i13      0.30
+i14      0.35
+i15      0.40
+i16      0.45
+i17      0.50
+i18      0.55
+i19      0.60
+i20      0.65;
+
+rate(i) = rate_values(i, 'value');
+
+* NPV at different discount rates
+Loop(i,
+    NPV_at_rate(i) = -initial_investment;
+    Loop(y$(ord(y) <= ESD_lifetime),
+        NPV_at_rate(i) = NPV_at_rate(i) + Annual_cashflow_calc(y) / power((1 + rate(i)), ord(y));
+    );
+);
+
+* Find where NPV changes sign (NPV crosses zero)
+Parameter 
+    rate_below, rate_above,
+    NPV_below, NPV_above;
+
+* Find rates where NPV changes from positive to negative
+Loop(i$(ord(i) < card(i)),
+    If((NPV_at_rate(i) > 0 and NPV_at_rate(i+1) < 0) or (NPV_at_rate(i) < 0 and NPV_at_rate(i+1) > 0),
+        rate_below = rate(i);
+        rate_above = rate(i+1);
+        NPV_below = NPV_at_rate(i);
+        NPV_above = NPV_at_rate(i+1);
+    );
+);
+
+* Interpolate to approximate IRR
+IRR = 100 * (rate_below + (rate_above - rate_below) * abs(NPV_below) / (abs(NPV_below) + abs(NPV_above)));
+    
+* Display economic results
+Display IRR, NPV_at_rate, discounted_profit, charging_cost, discounted_charging_cost, discounted_cost, total_discharged, initial_investment, annual_profit, annual_om_cost, Annual_cashflow_calc, 
+       Discounted_cashflow_calc, NPV, payback_period, LCOS, daily_cycles, annual_cycles, total_cycles, base_year_factor, yearly_cost_factor;
+
+* Export results to Excel
+execute_unload "model_results.gdx"
+    profit, annual_profit, discounted_profit, total_discharged, initial_investment, NPV, payback_period,
+    LCOS, IRR, daily_cycles, annual_cycles, total_cycles, annual_charging_cost, discounted_cost,
+    Revenue, c, d, z, P, positive_regime, ResLoad, yearly_cost_factor, initial_investment_by_year,
+    Annual_cashflow, annual_cashflow, annual_cashflow_calc, Discounted_cashflow_calc;
